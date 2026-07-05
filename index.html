@@ -1,0 +1,646 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>Lord of Time: Boss Edition</title>
+    <style>
+        body { 
+            margin: 0; 
+            background: #030208; 
+            color: #fff; 
+            font-family: 'Arial Black', Impact, sans-serif; 
+            display: flex; 
+            flex-direction: column; 
+            align-items: center; 
+            justify-content: center; 
+            min-height: 100vh; 
+            overflow: hidden; 
+            -webkit-tap-highlight-color: transparent;
+            user-select: none;
+            -webkit-user-select: none;
+        }
+        #game-container {
+            position: relative;
+            width: 100%;
+            max-width: 800px;
+            padding: 10px;
+            box-sizing: border-box;
+        }
+        canvas { 
+            border: 6px solid #000; 
+            background: #04040f; 
+            box-shadow: 0 0 40px rgba(0, 0, 0, 0.9); 
+            display: block; 
+            width: 100%;
+            height: auto;
+            aspect-ratio: 800 / 600;
+        }
+        #ui-info { 
+            margin-top: 10px; 
+            font-size: 13px; 
+            color: #ff5555; 
+            text-align: center; 
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        /* Dedicated Mobile Pause Button */
+        #mobile-pause-btn {
+            display: none;
+            position: absolute;
+            top: 25px;
+            right: 25px;
+            width: 50px;
+            height: 50px;
+            background: rgba(255, 85, 85, 0.3);
+            border: 2px solid #ff5555;
+            border-radius: 50%;
+            color: white;
+            font-family: Arial, sans-serif;
+            font-weight: bold;
+            font-size: 18px;
+            justify-content: center;
+            align-items: center;
+            z-index: 10;
+            cursor: pointer;
+        }
+        @media (max-width: 800px) {
+            #mobile-pause-btn {
+                display: flex; /* Only visible on smaller screens/mobile */
+            }
+        }
+    </style>
+</head>
+<body>
+
+<div id="game-container">
+    <div id="mobile-pause-btn">‖</div>
+    <canvas id="gameCanvas" width="800" height="600"></canvas>
+    <div id="ui-info">Spacebar to Pause/Restart | Defeat the Boss Every 2000 Points!</div>
+</div>
+
+<script>
+const canvas = document.getElementById("gameCanvas");
+const ctx = canvas.getContext("2d");
+const mobilePauseBtn = document.getElementById("mobile-pause-btn");
+
+const STATE_PLAYING = "PLAYING";
+const STATE_PAUSED = "PAUSED";
+const STATE_GAMEOVER = "GAMEOVER";
+let gameState = STATE_PLAYING;
+
+const player = {
+    x: 400, y: 500, width: 64, height: 64, speed: 10,
+    form: "MONKEY", 
+    bananas: 0, score: 0, lives: 3, maxLives: 4,
+    fireCooldown: 0, fireRateTicks: 14,
+    wheelRotation: 0, animationTick: 0,
+    combo: 1, comboTimer: 0
+};
+
+const boss = {
+    active: false,
+    lastSpawnScore: 0, 
+    x: 250, y: -200, targetY: 60, width: 300, height: 110,
+    health: 60, maxHealth: 60, 
+    vx: 3, movementTick: 0, fireTimer: 0,
+    mouthOpen: false, vulnerabilityTimer: 0
+};
+
+const keys = { ArrowLeft: false, ArrowRight: false, KeyA: false, KeyD: false };
+const mobileControls = { left: false, right: false };
+let screenShake = 0;
+let flashTimer = 0;
+let alertTimer = 0;
+
+// Universal Pause Toggle Logic
+function togglePause() {
+    if (gameState === STATE_PLAYING) {
+        gameState = STATE_PAUSED;
+    } else if (gameState === STATE_PAUSED) {
+        gameState = STATE_PLAYING;
+    }
+}
+
+// Desktop Inputs (Keyboard)
+window.addEventListener('keydown', (e) => { 
+    if (e.code in keys) { keys[e.code] = true; e.preventDefault(); } 
+    
+    if (e.code === "Space") {
+        e.preventDefault();
+        if (gameState === STATE_GAMEOVER) {
+            resetGame();
+        } else {
+            togglePause();
+        }
+    }
+});
+window.addEventListener('keyup', (e) => { if (e.code in keys) { keys[e.code] = false; e.preventDefault(); } });
+
+// Mobile Controls Framework
+function processTouches(e) {
+    if (gameState === STATE_GAMEOVER) { resetGame(); return; }
+    if (gameState === STATE_PAUSED) return; // Ignore movement processing if paused
+    
+    e.preventDefault();
+    const rect = canvas.getBoundingClientRect();
+    mobileControls.left = false; mobileControls.right = false;
+
+    for (let i = 0; i < e.touches.length; i++) {
+        const touch = e.touches[i];
+        const touchX = ((touch.clientX - rect.left) / rect.width) * canvas.width;
+        const touchY = ((touch.clientY - rect.top) / rect.height) * canvas.height;
+        if (touchY > 250) {
+            if (touchX < 400) mobileControls.left = true;
+            else mobileControls.right = true;
+        }
+    }
+}
+
+canvas.addEventListener('touchstart', processTouches, { passive: false });
+canvas.addEventListener('touchmove', processTouches, { passive: false });
+canvas.addEventListener('touchend', processTouches, { passive: false });
+
+// Mobile Pause Button Event Handler
+mobilePauseBtn.addEventListener('touchstart', (e) => {
+    e.preventDefault();
+    e.stopPropagation(); // Stop touch reaching the canvas underneath
+    if (gameState !== STATE_GAMEOVER) {
+        togglePause();
+    }
+}, { passive: false });
+
+let bullets = []; let items = []; let hazards = []; let particles = []; let stars = [];
+let spawnCounter = 0; let timeScale = 1.0;
+
+function generateStarfield() {
+    stars = [];
+    for (let i = 0; i < 30; i++) {
+        stars.push({ x: Math.random() * canvas.width, y: Math.random() * canvas.height, size: Math.random() * 3 + 1, speedMultiplier: Math.random() * 1.5 + 0.5 });
+    }
+}
+generateStarfield();
+
+function resetGame() {
+    player.x = 400; player.bananas = 0; player.score = 0; player.lives = 3; player.combo = 1;
+    player.form = "MONKEY"; player.fireCooldown = 0; timeScale = 1.0;
+    boss.active = false; boss.lastSpawnScore = 0; boss.x = 250; boss.y = -200; boss.health = boss.maxHealth;
+    bullets = []; items = []; hazards = []; particles = [];
+    alertTimer = 0; flashTimer = 0;
+    mobileControls.left = false; mobileControls.right = false;
+    generateStarfield();
+    gameState = STATE_PLAYING;
+}
+
+function spawnWave() {
+    if (boss.active) return; 
+
+    if (spawnCounter % 75 === 0) {
+        const startX = Math.random() * (canvas.width - 250) + 50;
+        createBaguette(startX, -60, 0);
+        createBaguette(startX - 50, -110, -0.1);
+        createBaguette(startX + 50, -110, 0.1);
+    }
+    if (spawnCounter % 40 === 0) {
+        createBaguette(Math.random() * (canvas.width - 60), -60, (Math.random() - 0.5) * 0.3);
+    }
+}
+
+function createBaguette(x, y, vx) {
+    hazards.push({
+        x: x, y: y, width: 34, height: 80, vx: vx, vy: 2.6 + Math.random() * 1.5,
+        derpEyeY1: -1 + (Math.random() * 3), derpEyeY2: -1 + (Math.random() * 3), crustRotation: Math.random() * 0.2 - 0.1
+    });
+}
+
+function spawnItems() {
+    if (Math.random() < 0.035 && player.form === "MONKEY") {
+        items.push({ x: Math.random() * (canvas.width - 40), y: -45, width: 36, height: 36, type: "BANANA", speed: 2.3 });
+    }
+
+    if (spawnCounter % 500 === 0 && player.lives < player.maxLives) {
+        items.push({ x: Math.random() * (canvas.width - 40), y: -45, width: 32, height: 32, type: "HEART_UPGRADE", speed: 2.5 });
+    }
+
+    if (player.bananas >= 10 && !items.some(i => i.type === "WATCH") && player.form === "MONKEY") {
+        items.push({ x: Math.random() * (canvas.width - 40), y: -40, width: 40, height: 40, type: "WATCH", speed: 2.0 });
+    }
+}
+
+function createExplosion(x, y, color, count=8) {
+    for (let i = 0; i < count; i++) {
+        particles.push({
+            x: x, y: y, vx: (Math.random() - 0.5) * 8, vy: (Math.random() - 0.5) * 8,
+            size: Math.random() * 6 + 2, color: color, alpha: 1
+        });
+    }
+}
+
+function checkCollision(rect1, rect2) {
+    return rect1.x < rect2.x + rect2.width && rect1.x + rect1.width > rect2.x && rect1.y < rect2.y + rect2.height && rect1.y + rect1.height > rect2.y;
+}
+
+function update() {
+    if (gameState !== STATE_PLAYING) return; // Halts update engine cleanly during Pause and Game Over
+    
+    spawnCounter++;
+    player.animationTick++;
+    
+    if (screenShake > 0) screenShake -= 0.1;
+    if (flashTimer > 0) flashTimer--;
+    if (alertTimer > 0) alertTimer--;
+
+    let currentMilestone = Math.floor(player.score / 2000) * 2000;
+    if (currentMilestone > boss.lastSpawnScore && !boss.active && currentMilestone > 0) {
+        boss.lastSpawnScore = currentMilestone;
+        boss.active = true;
+        boss.y = -200;
+        boss.x = 250;
+        boss.health = boss.maxHealth;
+        alertTimer = 120; 
+        screenShake = 4;
+    }
+
+    if (player.comboTimer > 0) {
+        player.comboTimer--;
+        if (player.comboTimer <= 0) player.combo = 1;
+    }
+
+    stars.forEach(s => {
+        s.y += s.speedMultiplier * 1.5 * timeScale; 
+        if (s.y > canvas.height) { s.y = -5; s.x = Math.random() * canvas.width; }
+    });
+
+    if (keys.ArrowLeft || keys.KeyA || mobileControls.left) player.x -= player.speed;
+    if (keys.ArrowRight || keys.KeyD || mobileControls.right) player.x += player.speed;
+    player.x = Math.max(0, Math.min(canvas.width - player.width, player.x));
+
+    if (player.animationTick % 4 === 0) player.wheelRotation += Math.PI / 4; 
+
+    if (player.form === "LORD_OF_TIME") {
+        timeScale = 0.18; player.bananas -= 0.05; player.score += 0.3; 
+        if (player.bananas <= 0) { player.bananas = 0; player.form = "MONKEY"; }
+    } else {
+        timeScale = 1.0;
+    }
+
+    player.fireCooldown++;
+    let currentFireRate = player.form === "LORD_OF_TIME" ? 4 : player.fireRateTicks;
+    if (player.fireCooldown >= currentFireRate) {
+        player.fireCooldown = 0;
+        let centerX = player.x + player.width / 2 - 12;
+        let centerY = player.y - 10;
+
+        if (player.form === "LORD_OF_TIME") {
+            bullets.push({ x: centerX, y: centerY, width: 24, height: 24, vx: 0, vy: -13, color: `hsl(${player.animationTick % 360}, 100%, 75%)` });
+            bullets.push({ x: centerX - 16, y: centerY, width: 20, height: 20, vx: -3, vy: -12, color: `hsl(${player.animationTick % 360}, 100%, 75%)` });
+            bullets.push({ x: centerX + 16, y: centerY, width: 20, height: 20, vx: 3, vy: -12, color: `hsl(${player.animationTick % 360}, 100%, 75%)` });
+        } else if (player.bananas >= 7) {
+            bullets.push({ x: centerX, y: centerY, width: 24, height: 24, vx: 0, vy: -9 });
+            bullets.push({ x: centerX - 12, y: centerY, width: 24, height: 24, vx: -2.2, vy: -8.5 });
+            bullets.push({ x: centerX + 12, y: centerY, width: 24, height: 24, vx: 2.2, vy: -8.5 });
+        } else if (player.bananas >= 4) {
+            bullets.push({ x: centerX - 12, y: centerY, width: 24, height: 24, vx: -1.2, vy: -9 });
+            bullets.push({ x: centerX + 12, y: centerY, width: 24, height: 24, vx: 1.2, vy: -9 });
+        } else {
+            bullets.push({ x: centerX, y: centerY, width: 24, height: 24, vx: 0, vy: -9 });
+        }
+    }
+
+    if (boss.active) {
+        boss.movementTick++;
+        if (boss.y < boss.targetY) {
+            boss.y += 2 * timeScale;
+        } else {
+            boss.x += boss.vx * timeScale;
+            if (boss.x <= 20 || boss.x >= canvas.width - boss.width - 20) {
+                boss.vx *= -1;
+            }
+
+            if (boss.movementTick % 160 === 0) {
+                boss.mouthOpen = !boss.mouthOpen;
+            }
+
+            boss.fireTimer += 1 * timeScale;
+            let currentAttackInterval = boss.mouthOpen ? 12 : 30;
+            if (boss.fireTimer >= currentAttackInterval) {
+                boss.fireTimer = 0;
+                let crumbX = boss.x + boss.width / 2;
+                let crumbY = boss.y + boss.height - 15;
+                
+                if (boss.mouthOpen) {
+                    hazards.push({ x: crumbX - 20, y: crumbY, width: 18, height: 18, vx: -2.5, vy: 4.5, isCrumb: true });
+                    hazards.push({ x: crumbX + 20, y: crumbY, width: 18, height: 18, vx: 2.5, vy: 4.5, isCrumb: true });
+                } else {
+                    hazards.push({ x: crumbX + (Math.random() * 120 - 60), y: crumbY, width: 20, height: 20, vx: 0, vy: 4.0, isCrumb: true });
+                }
+            }
+        }
+    }
+
+    for (let i = bullets.length - 1; i >= 0; i--) {
+        let b = bullets[i]; 
+        b.x += b.vx * (player.form === "LORD_OF_TIME" ? 1 : timeScale);
+        b.y += b.vy * (player.form === "LORD_OF_TIME" ? 1 : timeScale);
+        
+        if (boss.active && b.y < boss.y + boss.height && b.y > boss.y && b.x > boss.x && b.x < boss.x + boss.width) {
+            bullets.splice(i, 1);
+            if (boss.mouthOpen) {
+                boss.health--;
+                createExplosion(b.x, b.y, "#ff5555", 6);
+                screenShake = Math.max(screenShake, 1.5);
+
+                if (boss.health <= 0) {
+                    boss.active = false;
+                    player.score += 2000; 
+                    flashTimer = 20;
+                    screenShake = 14;
+                    createExplosion(boss.x + boss.width/2, boss.y + boss.height/2, "#ffd43b", 60);
+                }
+            } else {
+                createExplosion(b.x, b.y, "#ffffff", 2);
+                screenShake = 0.3;
+            }
+            continue;
+        }
+
+        for (let j = hazards.length - 1; j >= 0; j--) {
+            let h = hazards[j];
+            if (!h.isCrumb && checkCollision(b, h)) {
+                createExplosion(h.x + h.width/2, h.y + h.height/2, "#f3d19e", 8); 
+                hazards.splice(j, 1); 
+                bullets.splice(i, 1); 
+                player.score += 10 * player.combo;
+                player.combo = Math.min(5, player.combo + 1);
+                player.comboTimer = 120; 
+                screenShake = Math.max(screenShake, 1.2);
+                break;
+            }
+        }
+        if (b && b.y < -30) bullets.splice(i, 1);
+    }
+
+    spawnWave(); spawnItems();
+
+    for (let i = hazards.length - 1; i >= 0; i--) {
+        let h = hazards[i]; 
+        h.x += h.vx * timeScale;
+        h.y += h.vy * timeScale;
+        
+        if (checkCollision(player, h)) {
+            createExplosion(h.x + h.width/2, h.y + h.height/2, "#ff5555", 20); 
+            hazards.splice(i, 1);
+            player.combo = 1;
+            screenShake = 6;
+            
+            if (player.form === "LORD_OF_TIME") { player.bananas = Math.max(0, player.bananas - 4); } 
+            else { player.lives--; if (player.lives <= 0) gameState = STATE_GAMEOVER; }
+            continue;
+        }
+        if (h.y > canvas.height) { hazards.splice(i, 1); player.combo = 1; }
+    }
+
+    for (let i = items.length - 1; i >= 0; i--) {
+        let it = items[i]; it.y += it.speed * timeScale;
+        if (checkCollision(player, it)) {
+            items.splice(i, 1);
+            if (it.type === "BANANA") {
+                player.bananas = Math.min(10, player.bananas + 1); 
+                player.score += 25;
+                createExplosion(it.x + 18, it.y + 18, "#ffd43b", 10);
+            } else if (it.type === "HEART_UPGRADE") {
+                player.lives = Math.min(player.maxLives, player.lives + 1);
+                createExplosion(it.x + 16, it.y + 16, "#ff5555", 15);
+            } else if (it.type === "WATCH") {
+                player.form = "LORD_OF_TIME"; 
+                screenShake = 10;
+                createExplosion(it.x + 20, it.y + 20, "#ff79c6", 35);
+            }
+            continue;
+        }
+        if (it.y > canvas.height) items.splice(i, 1);
+    }
+
+    for (let i = particles.length - 1; i >= 0; i--) {
+        let p = particles[i]; p.x += p.vx; p.y += p.vy; p.alpha -= 0.03;
+        if (p.alpha <= 0) particles.splice(i, 1);
+    }
+}
+
+function drawHeart(x, y, size) {
+    ctx.save(); ctx.fillStyle = "#ff5555"; ctx.strokeStyle = "#000"; ctx.lineWidth = 3; ctx.beginPath();
+    ctx.moveTo(x, y + size / 4);
+    ctx.quadraticCurveTo(x, y, x - size / 2, y); ctx.quadraticCurveTo(x - size, y, x - size, y + size / 3);
+    ctx.quadraticCurveTo(x - size, y + size * 2/3, x - size / 4, y + size); ctx.lineTo(x, y + size); ctx.lineTo(x + size / 4, y + size);
+    ctx.quadraticCurveTo(x + size, y + size * 2/3, x + size, y + size / 3); ctx.quadraticCurveTo(x + size, y, x + size / 2, y);
+    ctx.quadraticCurveTo(x, y, x, y + size / 4); ctx.fill(); ctx.stroke(); ctx.restore();
+}
+
+function draw() {
+    ctx.save();
+    if (screenShake > 0 && gameState !== STATE_PAUSED) {
+        ctx.translate((Math.random() - 0.5) * screenShake * 4, (Math.random() - 0.5) * screenShake * 4);
+    }
+
+    ctx.fillStyle = player.form === "LORD_OF_TIME" ? "#100e1a" : "#04030b";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    
+    stars.forEach(s => {
+        ctx.fillStyle = player.form === "LORD_OF_TIME" ? "rgba(255, 121, 198, 0.4)" : "rgba(98, 114, 164, 0.35)";
+        ctx.fillRect(Math.floor(s.x), Math.floor(s.y), s.size, s.size);
+    });
+
+    bullets.forEach(b => {
+        ctx.save(); ctx.translate(b.x + b.width/2, b.y + b.height/2);
+        ctx.strokeStyle = "#000"; ctx.lineWidth = 3; ctx.fillStyle = b.color ? b.color : "#8a5a36"; 
+        ctx.beginPath(); ctx.ellipse(0, 6, 12, 6, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+        ctx.beginPath(); ctx.ellipse(0, 0, 9, 5, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(-5, -3); ctx.quadraticCurveTo(0, -12, 0, -14); ctx.quadraticCurveTo(2, -10, 5, -3); ctx.closePath(); ctx.fill(); ctx.stroke();
+        ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(-3, 0, 3.5, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+        ctx.beginPath(); ctx.arc(3, 0, 3.5, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+        ctx.fillStyle = "#000"; ctx.fillRect(-3.5, -0.5, 1.5, 1.5); ctx.fillRect(2.5, -1, 1.5, 1.5);
+        ctx.beginPath(); ctx.arc(0, 3, 2, 0, Math.PI); ctx.stroke();
+        ctx.restore();
+    });
+
+    hazards.forEach(h => {
+        ctx.save(); ctx.translate(h.x + h.width/2, h.y + h.height/2);
+        ctx.strokeStyle = "#000"; ctx.lineWidth = 3.5;
+        
+        if (h.isCrumb) {
+            ctx.fillStyle = "#d8b28a"; ctx.beginPath(); ctx.arc(0, 0, h.width/2, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+            ctx.fillStyle = "#a67c52"; ctx.fillRect(-4, -4, 3, 3); ctx.fillRect(2, 3, 2, 2);
+        } else {
+            ctx.rotate(h.crustRotation); ctx.fillStyle = "#c2803e"; 
+            ctx.beginPath(); ctx.roundRect(-h.width/2, -h.height/2, h.width, h.height, 14); ctx.fill(); ctx.stroke();
+            ctx.fillStyle = "#ecd0a5"; ctx.beginPath(); ctx.roundRect(-h.width/2 + 5, -h.height/2 + 5, h.width - 10, h.height - 10, 10); ctx.fill();
+            ctx.strokeStyle = "#965b25"; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(-8, -20); ctx.lineTo(8, -10); ctx.moveTo(-8, 0); ctx.lineTo(8, 10); ctx.moveTo(-8, 20); ctx.lineTo(8, 30); ctx.stroke();
+            ctx.strokeStyle = "#000"; ctx.lineWidth = 3.5; ctx.fillStyle = "#fff";
+            ctx.beginPath(); ctx.arc(-5, -10 + h.derpEyeY1, 6.5, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+            ctx.beginPath(); ctx.arc(5, -9 + h.derpEyeY2, 6.5, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+            ctx.fillStyle = "#000"; ctx.beginPath(); ctx.arc(-7, -10 + h.derpEyeY1, 1.8, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.arc(6, -11 + h.derpEyeY2, 1.8, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.arc(0, -3, 3, 0, Math.PI); ctx.stroke();
+        }
+        ctx.restore();
+    });
+
+    items.forEach(it => {
+        ctx.save(); ctx.strokeStyle = "#000"; ctx.lineWidth = 3.5;
+        if (it.type === "BANANA") {
+            ctx.translate(it.x + it.width/2, it.y + it.height/2); ctx.fillStyle = "#ffb86c";
+            ctx.beginPath(); ctx.arc(-8, 0, 15, -Math.PI/2, Math.PI/1.6, false); ctx.arc(-8, 0, 9, Math.PI/1.6, -Math.PI/2, true);
+            ctx.closePath(); ctx.fill(); ctx.stroke();
+            ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(-5, -2, 4.5, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+            ctx.beginPath(); ctx.arc(2, -4, 4.5, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+            ctx.fillStyle = "#000"; ctx.beginPath(); ctx.arc(-5, -2, 1.2, 0, Math.PI*2); ctx.fill();
+            ctx.beginPath(); ctx.arc(2, -4, 1.2, 0, Math.PI*2); ctx.fill();
+        } else if (it.type === "HEART_UPGRADE") {
+            drawHeart(it.x + 16, it.y + 10, 15);
+        } else if (it.type === "WATCH") {
+            ctx.translate(it.x + 20, it.y + 20); ctx.fillStyle = "#ff79c6"; ctx.fillRect(-6, -20, 12, 40); ctx.strokeRect(-6, -20, 12, 40);
+            ctx.beginPath(); ctx.arc(0, 0, 16, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); 
+            ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(0, 0, 11, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+        }
+        ctx.restore();
+    });
+
+    if (boss.active) {
+        ctx.save(); ctx.translate(boss.x, boss.y); ctx.strokeStyle = "#000"; ctx.lineWidth = 5;
+        ctx.fillStyle = boss.mouthOpen ? "#b06d2e" : "#cc7e3b";
+        ctx.beginPath(); ctx.roundRect(0, 0, boss.width, boss.height, 25); ctx.fill(); ctx.stroke();
+        ctx.fillStyle = boss.mouthOpen ? "#e6be8a" : "#fae3c3";
+        ctx.beginPath(); ctx.roundRect(12, 12, boss.width - 24, boss.height - 24, 18); ctx.fill();
+        ctx.strokeStyle = "#965b25"; ctx.lineWidth = 4;
+        ctx.beginPath(); ctx.moveTo(60, 20); ctx.lineTo(90, 45); ctx.moveTo(140, 20); ctx.lineTo(170, 45); ctx.moveTo(210, 20); ctx.lineTo(240, 45); ctx.stroke();
+        ctx.fillStyle = "#fff"; ctx.strokeStyle = "#000"; ctx.lineWidth = 4;
+        ctx.beginPath(); ctx.arc(90, 45, 20, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+        ctx.beginPath(); ctx.arc(210, 43, 20, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+        ctx.fillStyle = "#000";
+        ctx.beginPath(); ctx.arc(84, 45, 5, 0, Math.PI*2); ctx.fill();
+        ctx.beginPath(); ctx.arc(215, 40, 5, 0, Math.PI*2); ctx.fill();
+        if (boss.mouthOpen) {
+            ctx.fillStyle = "#631313"; ctx.beginPath(); ctx.ellipse(150, 80, 45, 20, 0, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+            ctx.fillStyle = "#fff"; ctx.font = "bold 11px Arial"; ctx.fillText("VULNERABLE", 112, 84);
+        } else {
+            ctx.lineWidth = 4; ctx.beginPath(); ctx.arc(150, 75, 14, 0, Math.PI); ctx.stroke();
+        }
+        ctx.restore();
+    }
+
+    particles.forEach(p => {
+        ctx.save(); ctx.globalAlpha = p.alpha; ctx.fillStyle = p.color;
+        ctx.fillRect(Math.floor(p.x), Math.floor(p.y), p.size || 4, p.size || 4); ctx.restore();
+    });
+
+    // Player Graphic Model
+    ctx.save(); ctx.translate(player.x, player.y); ctx.strokeStyle = "#000"; ctx.lineWidth = 3;
+    ctx.fillStyle = "#50fa7b"; ctx.beginPath(); ctx.roundRect(10, 32, 44, 16, 4); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = "#ff79c6"; ctx.beginPath(); ctx.roundRect(22, 22, 18, 10, 2); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = "#282a36"; ctx.beginPath(); ctx.arc(14, 46, 12, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.arc(50, 46, 12, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(14 + Math.cos(player.wheelRotation)*6 - 2, 46 + Math.sin(player.wheelRotation)*6 - 2, 4, 4);
+    ctx.fillRect(50 + Math.cos(player.wheelRotation + Math.PI/2)*6 - 2, 46 + Math.sin(player.wheelRotation + Math.PI/2)*6 - 2, 4, 4);
+    ctx.fillStyle = "#ffb86c"; ctx.beginPath(); ctx.arc(14, 8, 10, 0, Math.PI*2); ctx.fill(); ctx.stroke(); 
+    ctx.beginPath(); ctx.arc(50, 8, 10, 0, Math.PI*2); ctx.fill(); ctx.stroke(); 
+    ctx.fillStyle = "#ffb86c"; ctx.beginPath(); ctx.arc(32, 24, 10, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.arc(32, 9, 13, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = "#ffced2"; ctx.beginPath(); ctx.arc(32, 11, 9, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(27, 7, 6.5, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.arc(37, 7, 6.5, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = "#000"; ctx.beginPath(); ctx.arc(29, 8, 1.8, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(35, 6, 1.8, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(32, 13, 2.5, 0, Math.PI); ctx.stroke();
+    ctx.strokeStyle = "#ffb86c"; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(22, 26); ctx.quadraticCurveTo(6, 22, 6, 12); ctx.stroke();
+    if (player.form === "LORD_OF_TIME") {
+        ctx.fillStyle = player.animationTick % 8 < 4 ? "#f1fa8c" : "#ffb86c"; 
+        ctx.beginPath(); ctx.moveTo(16, 1); ctx.lineTo(2, -24); ctx.lineTo(22, -12); ctx.lineTo(32, -36); ctx.lineTo(42, -12); ctx.lineTo(62, -24); ctx.lineTo(48, 1); ctx.closePath(); ctx.fill(); ctx.stroke();
+    }
+    ctx.restore();
+
+    for (let i = 0; i < player.maxLives; i++) {
+        if (i < player.lives) drawHeart(35 + (i * 32), 35, 14);
+    }
+
+    ctx.fillStyle = "#fff"; ctx.font = "bold 18px Arial";
+    ctx.fillText(`SCORE: ${Math.floor(player.score)}`, 20, 80);
+    
+    let weaponName = "SINGLE CORE";
+    if (player.bananas >= 7) weaponName = "TRIPLE SPREAD";
+    else if (player.bananas >= 4) weaponName = "DUAL SPREAD";
+    if (player.form === "LORD_OF_TIME") weaponName = "TIME DILATION MATRIX";
+
+    ctx.fillStyle = "#ff79c6"; ctx.font = "bold 12px Arial";
+    ctx.fillText(`WEAPON SYSTEM: ${weaponName}`, canvas.width - 240, 75);
+    ctx.fillStyle = "#ffb86c";
+    ctx.fillText(`BANANA METER: ${player.bananas}/10`, canvas.width - 200, 40);
+
+    if (boss.active) {
+        ctx.fillStyle = "rgba(0,0,0,0.5)"; ctx.fillRect(canvas.width/2 - 150, 15, 300, 14);
+        ctx.fillStyle = "#ff5555"; ctx.fillRect(canvas.width/2 - 150, 15, (boss.health / boss.maxHealth) * 300, 14);
+        ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.strokeRect(canvas.width/2 - 150, 15, 300, 14);
+    }
+
+    if (flashTimer > 0) {
+        ctx.fillStyle = `rgba(255, 255, 255, ${flashTimer * 0.05})`; ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+
+    if (alertTimer > 0) {
+        ctx.save(); ctx.fillStyle = "rgba(255, 85, 85, 0.15)"; ctx.fillRect(0, 240, canvas.width, 100);
+        ctx.strokeStyle = "#ff5555"; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(0, 240); ctx.lineTo(canvas.width, 240); ctx.moveTo(0, 340); ctx.lineTo(canvas.width, 340); ctx.stroke();
+        ctx.fillStyle = "#fff"; ctx.font = "bold 34px Impact"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+        ctx.fillText("⚠️ MEGA BREADTH DISASTER APPROACHING ⚠️", canvas.width/2, 275);
+        ctx.font = "bold 16px Arial"; ctx.fillText("SHOOT IT ONLY WHEN THE MOUTH OPENS!", canvas.width/2, 315); ctx.restore();
+    }
+
+    // INTERACTIVE PAUSE OVERLAY MASK
+    if (gameState === STATE_PAUSED) {
+        ctx.save();
+        ctx.fillStyle = "rgba(4, 3, 10, 0.75)";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = "#ff5555";
+        ctx.font = "bold 50px Impact, Arial Black";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText("CHRONO LOCK: PAUSED", canvas.width / 2, canvas.height / 2 - 20);
+        ctx.fillStyle = "#fff";
+        ctx.font = "bold 16px Arial";
+        ctx.fillText("Press SPACEBAR or Tap Mobile Button to Resume", canvas.width / 2, canvas.height / 2 + 30);
+        ctx.restore();
+    }
+
+    // FIXED GAME OVER CONTAINER MENU
+    if (gameState === STATE_GAMEOVER) {
+        ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); 
+        ctx.fillStyle = "rgba(4, 3, 10, 0.98)"; ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = "#ff5555"; ctx.strokeStyle = "#000"; ctx.lineWidth = 6;
+        ctx.fillRect(100, 120, 600, 360); ctx.strokeRect(100, 120, 600, 360);
+        ctx.fillStyle = "#fff"; ctx.fillRect(115, 135, 570, 330); ctx.strokeRect(115, 135, 570, 330);
+        ctx.fillStyle = "#000"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+        
+        ctx.font = "bold 40px Impact, Arial Black"; 
+        ctx.fillText("CRUSTACEAN EXHAUST COLLAPSE!", canvas.width / 2, 190);
+        
+        ctx.font = "bold 16px Arial";
+        ctx.fillText("Dude, the monkey absorbed a critical density of gluten components.", canvas.width / 2, 250);
+        ctx.fillText("His flat paper-cutout body ran out of cache buffer storage spaces.", canvas.width / 2, 275);
+        ctx.fillText("His big glowing ears are venting raw wheat combustion smoke.", canvas.width / 2, 300);
+        
+        ctx.fillStyle = "#ff79c6"; ctx.font = "bold 26px Impact";
+        ctx.fillText(`TOTAL SURVIVED SCORE: ${Math.floor(player.score)}`, canvas.width / 2, 360);
+        
+        ctx.fillStyle = (player.animationTick % 30 < 15) ? "#50fa7b" : "#ff5555";
+        ctx.font = "bold 16px 'Courier New', monospace";
+        ctx.fillText("PRESS SPACEBAR OR TAP SCREEN TO RESTART!", canvas.width / 2, 425);
+        ctx.restore();
+    }
+    ctx.restore();
+}
+
+function run() { update(); draw(); requestAnimationFrame(run); }
+run();
+</script>
+
+</body>
+</html>
